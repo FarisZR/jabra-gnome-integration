@@ -1,0 +1,17 @@
+{
+  "name": "Jabra Integration",
+  "description": "Jabra Link dongle integration through jabridge: a top-bar toggle that keeps your headset connected, and pausing media when the headset disconnects.",
+  "uuid": "jabra-integration@fariszr.com",
+  "shell-version": [
+    "48",
+    "49",
+    "50"
+  ],
+  "settings-schema": "org.gnome.shell.extensions.jabra-integration",
+  "url": "https://github.com/FarisZR/jabra-gnome-integration",
+  "version": 1,
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

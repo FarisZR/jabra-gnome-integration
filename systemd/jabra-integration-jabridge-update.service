@@ -1,0 +1,8 @@
+[Unit]
+Description=Update jabridge to the latest signed release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/jabridge update

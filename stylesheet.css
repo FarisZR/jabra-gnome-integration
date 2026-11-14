@@ -1,0 +1,8 @@
+/* Off: dimmed. Trying: amber. Connected: normal panel colour. */
+.jabra-off {
+  opacity: 0.4;
+}
+
+.jabra-connecting {
+  color: #f6d32d;
+}

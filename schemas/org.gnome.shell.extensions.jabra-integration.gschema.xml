@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.jabra-integration"
+          path="/org/gnome/shell/extensions/jabra-integration/">
+    <key name="auto-connect" type="b">
+      <default>true</default>
+      <summary>Keep the headset connected</summary>
+      <description>When on, keep asking the Jabra Link dongle to connect its remembered headset until it is connected. Toggled by clicking the top-bar icon.</description>
+    </key>
+    <key name="pause-on-disconnect" type="b">
+      <default>true</default>
+      <summary>Pause media when the headset disconnects</summary>
+      <description>Pause playing media players (MPRIS) when the headset disconnects while the Jabra Link is the sound output.</description>
+    </key>
+    <key name="headset-name" type="s">
+      <default>''</default>
+      <summary>Preferred headset</summary>
+      <description>Part of the remembered headset's name to auto-connect. Empty means the first remembered headset.</description>
+    </key>
+  </schema>
+</schemalist>
