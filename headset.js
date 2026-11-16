@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//
-// Tracks whether the Jabra Link dongle's headset is connected, reports when it
-// disconnects, and (when auto-connect is on) keeps asking the dongle to connect
-// it. No GNOME Shell imports, so it also runs under plain gjs.
-
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import {EventStream, isCancelled, rpc} from './jabridge.js';
+import {HeadsetState} from './headsetState.js';
 
-const CHECK_SECONDS = 5; // fallback poll; events usually arrive first
-const RETRY_SECONDS = 10; // between connect attempts
+const CHECK_SECONDS = 5;
+const RETRY_SECONDS = 10;
 const REFRESH_EVENTS = new Set(['device.pairing.update', 'device.attached', 'device.detached']);
 
 /**
@@ -22,16 +18,11 @@ const REFRESH_EVENTS = new Set(['device.pairing.update', 'device.attached', 'dev
 export class HeadsetMonitor {
     constructor({autoConnect = true, preferredName = '', onState = () => {}, onDisconnect = () => {}} = {}) {
         this._autoConnect = autoConnect;
-        this.preferredName = preferredName;
+        this._preferredName = preferredName;
         this._onState = onState;
         this._onDisconnect = onDisconnect;
-        this._connected = null;
-        this._headset = null;
-        this._nextAttempt = 0;
-        this._cancellable = null;
-        this._timeoutId = 0;
-        this._busy = false;
-        this._again = false;
+        this._state = new HeadsetState();
+        this._run = null;
         this._events = new EventStream({
             onEvent: method => {
                 if (REFRESH_EVENTS.has(method))
@@ -47,137 +38,128 @@ export class HeadsetMonitor {
 
     set autoConnect(value) {
         this._autoConnect = value;
-        this._nextAttempt = 0; // turning it on tries right away
+        this._configurationChanged();
+    }
+
+    set preferredName(value) {
+        this._preferredName = value;
+        this._configurationChanged();
+    }
+
+    _configurationChanged() {
+        if (this._run)
+            this._run.nextAttempt = 0;
         this.refresh();
     }
 
     start() {
-        if (this._cancellable)
+        if (this._run)
             return;
-        this._cancellable = new Gio.Cancellable();
+        this._state = new HeadsetState();
+        this._run = {cancellable: new Gio.Cancellable(), timeoutId: 0,
+            busy: false, again: false, nextAttempt: 0};
         this._events.start();
         this.refresh();
     }
 
     stop() {
         this._events.stop();
-        this._cancellable?.cancel();
-        this._cancellable = null;
-        this._clearTimeout();
+        const run = this._run;
+        this._run = null;
+        run?.cancellable.cancel();
+        if (run?.timeoutId)
+            GLib.source_remove(run.timeoutId);
     }
 
-    /** Re-reads the state now. Calls made while one is running are merged. */
     refresh() {
-        if (!this._cancellable)
+        const run = this._run;
+        if (!run)
             return;
-        if (this._busy) {
-            this._again = true;
+        if (run.busy) {
+            run.again = true;
             return;
         }
-        this._busy = true;
-        const cancellable = this._cancellable;
-        this._refresh(cancellable).catch(logError).finally(() => {
-            this._busy = false;
-            if (this._again && !cancellable.is_cancelled()) {
-                this._again = false;
+        if (run.timeoutId) {
+            GLib.source_remove(run.timeoutId);
+            run.timeoutId = 0;
+        }
+        run.busy = true;
+        this._refresh(run).catch(error => {
+            if (!isCancelled(error))
+                console.warn(`Jabra Integration: refresh failed: ${error.message}`);
+        }).finally(() => {
+            if (run !== this._run)
+                return;
+            run.busy = false;
+            if (run.again) {
+                run.again = false;
                 this.refresh();
+            } else {
+                run.timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, CHECK_SECONDS, () => {
+                    run.timeoutId = 0;
+                    this.refresh();
+                    return GLib.SOURCE_REMOVE;
+                });
             }
         });
     }
 
-    _clearTimeout() {
-        if (this._timeoutId) {
-            GLib.source_remove(this._timeoutId);
-            this._timeoutId = 0;
-        }
-    }
-
-    async _list(cancellable) {
+    async _list(run) {
+        let devices;
+        let message;
         try {
-            return await rpc('bt.list', null, {timeout: 5, cancellable}) ?? [];
+            devices = await rpc('bt.list', null, {timeout: 5, cancellable: run.cancellable}) ?? [];
         } catch (error) {
             if (isCancelled(error))
                 throw error;
-            this._connected = null;
-            this._emit({connecting: false, message: `jabridge service unavailable: ${error.message}`});
-            return null;
+            devices = null;
+            message = `jabridge service unavailable: ${error.message}`;
         }
-    }
-
-    // Returns false when the state is unknown (jabridge unreachable).
-    _apply(devices) {
+        // Cancellation may race a successful reply already queued by GIO.
+        run.cancellable.set_error_if_cancelled();
+        const disconnected = this._state.observe(devices);
+        if (disconnected)
+            this._onDisconnect(this._state.headset);
         if (devices === null)
-            return false;
-        const connected = devices.find(d => d.connected);
-        const wasConnected = this._connected;
-        this._connected = Boolean(connected);
-        if (connected)
-            this._headset = connected.name;
-        // Only an explicit "remembered but not connected" counts. An empty list
-        // also appears while jabridge restarts, and pausing then would be wrong.
-        if (wasConnected === true && !connected && devices.length > 0)
-            this._onDisconnect(this._headset);
-        return true;
+            this._emit({connecting: false, message});
+        return devices;
     }
 
-    _pick(devices) {
-        const wanted = this.preferredName.trim().toLowerCase();
-        return (wanted && devices.find(d => (d.name ?? '').toLowerCase().includes(wanted))) || devices[0];
-    }
-
-    async _refresh(cancellable) {
-        this._clearTimeout();
+    async _refresh(run) {
         let message = null;
-        try {
-            let devices = await this._list(cancellable);
-            const known = this._apply(devices);
-            const now = GLib.get_monotonic_time();
-            if (known && !this._connected && this._autoConnect && now >= this._nextAttempt) {
-                const target = this._pick(devices);
-                if (target) {
-                    this._headset = target.name;
-                    this._emit({connecting: true, message: `Connecting ${target.name}…`});
-                    try {
-                        // bt.connect disconnects any other remembered headset
-                        // first, which is why it only runs when none is connected.
-                        await rpc('bt.connect', {index: target.id}, {timeout: 25, cancellable});
-                    } catch (error) {
-                        if (isCancelled(error))
-                            throw error;
-                        message = error.message;
-                    }
-                    this._nextAttempt = GLib.get_monotonic_time() + RETRY_SECONDS * 1e6;
-                    devices = await this._list(cancellable);
-                    this._apply(devices);
-                } else {
-                    message = 'No headset is remembered by the Jabra Link dongle';
-                }
-            }
-            if (devices !== null) {
-                message ??= this._connected ? 'Connected' : 'Not connected';
-                this._emit({connecting: false, message});
-            }
-        } catch (error) {
-            if (isCancelled(error))
-                return;
-            throw error;
-        }
-        if (cancellable.is_cancelled())
+        let devices = await this._list(run);
+        if (devices === null)
             return;
-
-        let delay = CHECK_SECONDS;
-        if (this._connected === false && this._autoConnect)
-            delay = Math.max(1, Math.ceil((this._nextAttempt - GLib.get_monotonic_time()) / 1e6));
-        this._timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, delay, () => {
-            this._timeoutId = 0;
-            this.refresh();
-            return GLib.SOURCE_REMOVE;
-        });
+        if (!this._state.connected && this._autoConnect &&
+            GLib.get_monotonic_time() >= run.nextAttempt) {
+            const target = this._state.select(devices, this._preferredName);
+            if (target) {
+                this._state.headset = target.name;
+                this._emit({connecting: true, message: `Connecting ${target.name}…`});
+                try {
+                    // bt.connect disconnects other remembered headsets first.
+                    await rpc('bt.connect', {index: target.id}, {timeout: 25, cancellable: run.cancellable});
+                } catch (error) {
+                    if (isCancelled(error))
+                        throw error;
+                    message = error.message;
+                }
+                run.cancellable.set_error_if_cancelled();
+                run.nextAttempt = GLib.get_monotonic_time() + RETRY_SECONDS * 1e6;
+                devices = await this._list(run);
+            } else {
+                message = 'No headset is remembered by the Jabra Link dongle';
+            }
+        }
+        if (devices !== null) {
+            message ??= this._state.connected ? 'Connected' : 'Not connected';
+            this._emit({connecting: false, message});
+        }
     }
 
     _emit({connecting, message}) {
-        if (!this._cancellable)
+        if (!this._run)
             return;
-        this._onState({connected: this._connected, headset: this._headset, connecting, message});
+        this._onState({connected: this._state.connected, headset: this._state.headset, connecting, message});
     }
 }

@@ -41,9 +41,31 @@ The script:
 Run `./install.sh` again to update. Run `./install.sh --uninstall` to remove the
 extension and the timer. jabridge stays installed.
 
+### Homebrew (rolling main builds)
+
+```sh
+brew tap fariszr/tap
+brew install --cask fariszr/tap/jabra-gnome-integration
+```
+
+Install [jabridge](https://github.com/Watchdog0x/jabridge) separately and run
+`jabridge setup` to configure device access and its user service. The cask installs
+only the extension. Back up an existing manual extension directory before the
+first cask install. Log out and back in, then run:
+
+```sh
+gnome-extensions enable jabra-integration@fariszr.com
+```
+
+Every successful build of the latest `main` commit publishes immutable bundles
+with the full commit hash as its version. The tap follows these builds. Run
+`brew update && brew upgrade --cask jabra-gnome-integration` to update, then log
+out and back in. Homebrew owns the extension directory after cask installation;
+use Homebrew for upgrades and removal.
+
 ## Requirements
 
-- GNOME Shell 48–50 (tested on 50)
+- GNOME Shell 48–51
 - A Jabra Link dongle that jabridge can control: Link 380 (`0b0e:24c7`, `24c8`)
   or Link 390 (`0b0e:2e57`). Check yours with `lsusb | grep 0b0e`.
 - The headset has been paired with the dongle at least once.
@@ -71,3 +93,26 @@ calls `bt.connect` to connect it. If something isn't working, run
 `jabridge status` and `jabridge service status`.
 
 Not affiliated with Jabra or GN Audio.
+
+## Development
+
+Run `./scripts/test.sh` for syntax/schema checks, a fake-jabridge socket integration
+test under GJS, and package validation. Build both installation formats with:
+
+```sh
+python3 scripts/package.py dist --commit "$(git rev-parse HEAD)"
+```
+
+Runtime modules live at the root: `extension.js` composes the Shell lifecycle,
+`indicator.js` owns Shell actors/input, `headset.js` owns observation and reconnect
+sessions, `headsetState.js` owns headset selection/disconnect rules, `jabridge.js`
+owns JSON-RPC/subscriptions, and `media.js` owns MPRIS. Session cancellation must
+prevent old requests from emitting state or acting after disable.
+
+The package builder is shared by local installation and CI, so new root runtime
+modules are included automatically. See [the decision log](docs/decisions.md) for
+intentional compatibility and external-service special cases.
+
+The rolling build workflow uses `TAP_GITHUB_TOKEN` to dispatch the tap's sync
+workflow after publication. Its token needs permission to run Actions in
+`FarisZR/homebrew-tap`; the tap also synchronizes on its six-hour schedule.

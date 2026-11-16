@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
-# Installs jabridge (if missing), a weekly jabridge self-update timer and the
-# Jabra Integration GNOME extension. Run as your normal user.
-#
-#   ./install.sh              install or update
-#   ./install.sh --uninstall  remove the extension and the update timer
 set -euo pipefail
 
-UUID="jabra-integration@fariszr.com"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+command -v python3 >/dev/null 2>&1 || { echo 'python3 is required' >&2; exit 1; }
+UUID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["uuid"])' "$SRC/metadata.json")"
 EXT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$UUID"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 JABRIDGE="$HOME/.local/bin/jabridge"
@@ -20,9 +16,8 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; 
 
 [[ $EUID -ne 0 ]] || die "run this as your normal user, not root"
 
-# Adds the extension to (or removes it from) GNOME Shell's enabled list. Done
-# through GSettings because GNOME Shell on Wayland only loads a new or updated
-# extension after you log in again.
+# GNOME Shell on Wayland loads newly installed extensions after the next login.
+# GSettings can enable them before Shell knows about them.
 set_extension_enabled() {
     gjs -c "
 const {Gio} = imports.gi;
@@ -96,14 +91,29 @@ install_update_timer() {
 install_extension() {
     need glib-compile-schemas; need gjs
     say "Installing the GNOME extension"
-    rm -rf "$EXT_DIR"
-    mkdir -p "$EXT_DIR/schemas"
-    install -m 0644 "$SRC"/{metadata.json,extension.js,jabridge.js,headset.js,media.js,stylesheet.css} "$EXT_DIR/"
-    install -m 0644 "$SRC"/schemas/*.gschema.xml "$EXT_DIR/schemas/"
-    glib-compile-schemas "$EXT_DIR/schemas"
+    local staging backup
+    mkdir -p "$(dirname "$EXT_DIR")"
+    staging="$(mktemp -d "$(dirname "$EXT_DIR")/.jabra-install.XXXXXX")"
+    if ! python3 "$SRC/scripts/package.py" "$staging/payload" --stage; then
+        rm -rf "$staging"
+        die "extension validation failed; existing installation was kept"
+    fi
+    backup="$staging/previous"
+    if [[ -e $EXT_DIR ]]; then
+        mv "$EXT_DIR" "$backup"
+    fi
+    if ! mv "$staging/payload" "$EXT_DIR"; then
+        [[ ! -e $backup ]] || mv "$backup" "$EXT_DIR"
+        rm -rf "$staging"
+        die "could not install the extension"
+    fi
+    rm -rf "$staging"
 
     set_extension_enabled on
 }
+
+[[ $# -le 1 ]] || die "usage: $0 [--uninstall]"
+[[ $# -eq 0 || ${1:-} == '--uninstall' ]] || die "usage: $0 [--uninstall]"
 
 if [[ ${1:-} == "--uninstall" ]]; then
     uninstall
@@ -114,7 +124,8 @@ install_jabridge
 # jabridge setup enables its service; just make sure it runs. --no-block
 # because jabridge.service is ordered After=default.target.
 systemctl --user is-active --quiet jabridge.service ||
-    systemctl --user start --no-block jabridge.service 2>/dev/null || true
+    systemctl --user start --no-block jabridge.service ||
+    printf 'Warning: could not start jabridge.service; run jabridge setup.\n' >&2
 install_update_timer
 install_extension
 

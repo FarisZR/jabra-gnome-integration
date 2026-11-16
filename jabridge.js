@@ -2,7 +2,6 @@
 //
 // Minimal client for the jabridge service's JSON-RPC Unix socket
 // (https://github.com/Watchdog0x/jabridge/blob/main/docs/IPC.md).
-// Uses only Gio/GLib so it also runs under plain gjs.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -39,7 +38,6 @@ async function readMessage(input, decoder, cancellable) {
     return JSON.parse(decoder.decode(line));
 }
 
-/** Sends one request on its own connection and returns its result. */
 export async function rpc(method, params = null, {timeout = 25, cancellable = null} = {}) {
     const client = new Gio.SocketClient({timeout});
     const conn = await client.connect_async(Gio.UnixSocketAddress.new(socketPath()), cancellable);
@@ -50,7 +48,7 @@ export async function rpc(method, params = null, {timeout = 25, cancellable = nu
         for (;;) {
             const reply = await readMessage(input, decoder, cancellable);
             if (reply.id !== 1)
-                continue; // a notification
+                continue;
             if (reply.error)
                 throw new Error(reply.error.message ?? 'jabridge error');
             return reply.result;
@@ -60,89 +58,93 @@ export async function rpc(method, params = null, {timeout = 25, cancellable = nu
     }
 }
 
-/**
- * Keeps a subscription to jabridge notifications open, reconnecting when the
- * service restarts. onEvent(method, params) gets every notification;
- * onSubscribed() runs after each (re)subscribe so callers can reload state.
- */
 export class EventStream {
     constructor({onEvent = () => {}, onSubscribed = () => {}} = {}) {
         this._onEvent = onEvent;
         this._onSubscribed = onSubscribed;
-        this._generation = 0;
-        this._cancellable = null;
-        this._pingId = 0;
-        this._waitId = 0;
-        this._wake = null;
+        this._run = null;
     }
 
     start() {
-        if (this._cancellable)
+        if (this._run)
             return;
-        this._cancellable = new Gio.Cancellable();
-        this._run(++this._generation, this._cancellable);
+        const run = {cancellable: new Gio.Cancellable(), pingId: 0, waitId: 0, wake: null};
+        this._run = run;
+        this._listen(run).catch(error =>
+            console.warn(`Jabra Integration: event stream failed: ${error.message}`));
     }
 
     stop() {
-        this._generation++;
-        this._cancellable?.cancel();
-        this._cancellable = null;
-        this._clearPing();
-        if (this._waitId) {
-            GLib.source_remove(this._waitId);
-            this._waitId = 0;
-        }
-        this._wake?.();
-        this._wake = null;
+        const run = this._run;
+        this._run = null;
+        if (!run)
+            return;
+        run.cancellable.cancel();
+        this._clearPing(run);
+        if (run.waitId)
+            GLib.source_remove(run.waitId);
+        run.wake?.();
     }
 
-    _clearPing() {
-        if (this._pingId) {
-            GLib.source_remove(this._pingId);
-            this._pingId = 0;
+    _clearPing(run) {
+        if (run.pingId) {
+            GLib.source_remove(run.pingId);
+            run.pingId = 0;
         }
     }
 
-    async _run(generation, cancellable) {
-        while (generation === this._generation) {
+    async _listen(run) {
+        while (run === this._run) {
             let conn = null;
+            const cancellable = new Gio.Cancellable();
+            const cancelId = run.cancellable.connect(() => cancellable.cancel());
             try {
-                conn = await new Gio.SocketClient().connect_async(
+                run.cancellable.set_error_if_cancelled();
+                conn = await new Gio.SocketClient({timeout: 25}).connect_async(
                     Gio.UnixSocketAddress.new(socketPath()), cancellable);
                 await writeMessage(conn, {id: 1, method: 'subscribe'}, cancellable);
-                this._pingId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, PING_SECONDS, () => {
-                    writeMessage(conn, {id: 2, method: 'service.ping'}, cancellable).catch(() => {});
+                run.pingId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, PING_SECONDS, () => {
+                    writeMessage(conn, {id: 2, method: 'service.ping'}, cancellable)
+                        .catch(() => cancellable.cancel());
                     return GLib.SOURCE_CONTINUE;
                 });
                 const input = new Gio.DataInputStream({base_stream: conn.get_input_stream()});
                 const decoder = new TextDecoder();
                 for (;;) {
                     const message = await readMessage(input, decoder, cancellable);
-                    if (generation !== this._generation)
-                        return;
-                    if (message.id === 1 && message.result)
+                    run.cancellable.set_error_if_cancelled();
+                    if (message.id === 1) {
+                        if (message.error)
+                            throw new Error(message.error.message ?? 'Subscription rejected');
                         this._onSubscribed();
-                    else if (message.method)
+                    } else if (message.method) {
                         this._onEvent(message.method, message.params);
+                    }
                 }
             } catch (error) {
-                if (isCancelled(error))
+                if (run.cancellable.is_cancelled())
                     return;
+                console.debug(`Jabra Integration: event stream reconnecting: ${error.message}`);
             } finally {
-                this._clearPing();
-                conn?.close(null);
+                run.cancellable.disconnect(cancelId);
+                this._clearPing(run);
+                try {
+                    conn?.close(null);
+                } catch (error) {
+                    console.debug(`Jabra Integration: closing event stream: ${error.message}`);
+                }
             }
-            if (generation !== this._generation)
+            if (run !== this._run)
                 return;
             await new Promise(resolve => {
-                this._wake = resolve;
-                this._waitId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, RECONNECT_SECONDS, () => {
-                    this._waitId = 0;
+                run.wake = resolve;
+                run.waitId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, RECONNECT_SECONDS, () => {
+                    run.waitId = 0;
                     resolve();
                     return GLib.SOURCE_REMOVE;
                 });
             });
-            this._wake = null;
+            run.wake = null;
         }
     }
 }
